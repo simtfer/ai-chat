@@ -43,6 +43,18 @@ export function ChatRoom({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialGroup.id]);
 
+  useEffect(() => {
+    const checkIdle = () => {
+      if (document.visibilityState === "visible") useChatStore.getState().checkIdle();
+    };
+    document.addEventListener("visibilitychange", checkIdle);
+    window.addEventListener("focus", checkIdle);
+    return () => {
+      document.removeEventListener("visibilitychange", checkIdle);
+      window.removeEventListener("focus", checkIdle);
+    };
+  }, []);
+
   const activeGroup = group ?? initialGroup;
   const activeMembers = group ? members : initialMembers;
   const avatarMembers = activeMembers.map((m) => ({

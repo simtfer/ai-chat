@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 export function Composer({ onAddMembers }: { onAddMembers: () => void }) {
   const members = useChatStore((s) => s.members);
   const running = useChatStore((s) => s.running);
+  const pauseReason = useChatStore((s) => s.pauseReason);
   const streaming = useChatStore((s) => s.streamingMessageId);
   const sendUserMessage = useChatStore((s) => s.sendUserMessage);
   const setRunning = useChatStore((s) => s.setRunning);
@@ -79,7 +80,9 @@ export function Composer({ onAddMembers }: { onAddMembers: () => void }) {
         {!running ? (
           <div className="mb-2 flex items-center justify-between gap-3 rounded-xl border border-amber-400/15 bg-amber-400/[0.05] px-3 py-1.5">
             <p className="text-[11px] text-amber-200/80">
-              自动聊天已暂停，AI 不会主动接话
+              {pauseReason === "idle"
+                ? "已自动暂停：超过 5 分钟没有操作"
+                : "自动聊天已暂停，AI 不会主动接话"}
             </p>
             <button
               type="button"
@@ -189,7 +192,7 @@ export function Composer({ onAddMembers }: { onAddMembers: () => void }) {
         <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 px-1 text-[10.5px] text-muted/70">
           <span>Enter 发送 · Shift + Enter 换行 · @ 点名</span>
           <span className={cn(streaming && "text-violet-300/80")}>
-            {streaming ? "AI 正在生成…" : running ? "AI 会自己接话" : "自动聊天已暂停"}
+            {streaming ? "AI 正在生成…" : running ? "AI 会自己接话 · 5 分钟无操作自动暂停" : "自动聊天已暂停"}
           </span>
         </div>
       </div>

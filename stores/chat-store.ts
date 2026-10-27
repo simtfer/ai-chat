@@ -9,6 +9,7 @@ import { randRange } from "@/lib/utils";
 import type { Group, Member, Message, TurnReason } from "@/lib/types";
 
 const MAX_MESSAGES = 400;
+const IDLE_PAUSE_MS = 5 * 60_000;
 
 type ChatState = {
   group: Group | null;
@@ -21,11 +22,13 @@ type ChatState = {
   pendingBoost: boolean;
   lastSpeakerId: string | null;
   error: string | null;
+  pauseReason: "idle" | null;
 
   init: (data: { group: Group; members: Member[]; messages: Message[] }) => void;
   destroy: () => void;
-  setRunning: (running: boolean) => Promise<void>;
+  setRunning: (running: boolean, options?: { auto?: boolean }) => Promise<void>;
   toggleRunning: () => Promise<void>;
+  checkIdle: () => void;
   speak: (characterId: string, reason?: TurnReason) => Promise<void>;
   nudge: (characterId?: string) => Promise<void>;
   retry: (messageId: string) => Promise<void>;
@@ -47,7 +50,36 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let wake: (() => void) | null = null;
 let activeAbort: AbortController | null = null;
 let inFlight = false;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+let lastActivityAt = Date.now();
 
+function clearIdleTimer() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = null;
+}
+
+function armIdleTimer() {
+  clearIdleTimer();
+  if (!useChatStore.getState().running) return;
+  const remaining = lastActivityAt + IDLE_PAUSE_MS - Date.now();
+  if (remaining <= 0) {
+    void useChatStore.getState().setRunning(false, { auto: true });
+    return;
+  }
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    void useChatStore.getState().setRunning(false, { auto: true });
+  }, remaining);
+}
+
+function markActivity() {
+  lastActivityAt = Date.now();
+  if (useChatStore.getState().running) armIdleTimer();
+}
+
+function idleExpired() {
+  return Date.now() - lastActivityAt >= IDLE_PAUSE_MS;
+}
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
@@ -111,6 +143,10 @@ async function runLoop(token: number) {
 
   const current = useChatStore.getState();
   if (!current.group || !current.running) return;
+  if (idleExpired()) {
+    void current.setRunning(false, { auto: true });
+    return;
+  }
   if (inFlight) {
     await sleep(700);
     if (token === loopToken) void runLoop(token);
@@ -148,10 +184,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
   pendingBoost: false,
   lastSpeakerId: null,
   error: null,
+  pauseReason: null,
 
   init: ({ group, members, messages }) => {
     loopToken += 1;
     stopTimers();
+    clearIdleTimer();
+    lastActivityAt = Date.now();
     set({
       group,
       members,
@@ -163,13 +202,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       pendingBoost: false,
       lastSpeakerId: null,
       error: null,
+      pauseReason: null,
     });
-    if (group.isRunning) startLoop();
+    if (group.isRunning) {
+      startLoop();
+      armIdleTimer();
+    }
   },
 
   destroy: () => {
     loopToken += 1;
     stopTimers();
+    clearIdleTimer();
     activeAbort?.abort();
     activeAbort = null;
     inFlight = false;
@@ -180,30 +224,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  setRunning: async (running) => {
+  setRunning: async (running, options) => {
     const group = get().group;
     if (!group) return;
+    const auto = options?.auto === true;
     if (running) {
-      set({ running: true });
+      lastActivityAt = Date.now();
+      set({ running: true, pauseReason: null });
     } else {
       loopToken += 1;
       stopTimers();
+      clearIdleTimer();
       activeAbort?.abort();
       activeAbort = null;
-      set({ running: false, nextAt: null, pendingBoost: false });
+      set({ running: false, nextAt: null, pendingBoost: false, pauseReason: auto ? "idle" : null });
+      if (auto) toast.message("5 分钟没有操作，已自动暂停");
     }
     try {
       const updated = await api.updateGroup(group.id, { isRunning: running });
       set({ group: updated.group, running: updated.group.isRunning });
-      if (updated.group.isRunning) startLoop();
+      if (updated.group.isRunning) {
+        startLoop();
+        armIdleTimer();
+      } else {
+        clearIdleTimer();
+      }
     } catch (error) {
-      set({ running: group.isRunning });
+      set({ running: group.isRunning, pauseReason: null });
+      if (group.isRunning) {
+        lastActivityAt = Date.now();
+        startLoop();
+        armIdleTimer();
+      }
       toast.error((error as Error).message);
     }
   },
 
   toggleRunning: async () => {
     await get().setRunning(!get().running);
+  },
+
+  checkIdle: () => {
+    if (!get().running) return;
+    if (idleExpired()) {
+      void get().setRunning(false, { auto: true });
+      return;
+    }
+    armIdleTimer();
   },
 
   speak: async (characterId, reason = "nudge") => {
@@ -348,6 +415,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   nudge: async (characterId) => {
     const state = get();
     if (!state.group) return;
+    markActivity();
     if (inFlight) {
       toast.message("还在生成中，稍等一下");
       return;
@@ -384,6 +452,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const state = get();
     const text = content.trim();
     if (!state.group || !text) return;
+    markActivity();
     const groupId = state.group.id;
     const optimisticId = `local-${crypto.randomUUID()}`;
     const optimistic: Message = {
@@ -412,6 +481,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   updateMember: async (memberId, patch) => {
     const previous = get().members;
+    markActivity();
     set({ members: previous.map((m) => (m.id === memberId ? { ...m, ...patch } : m)) });
     const group = get().group;
     if (!group) return;
@@ -427,6 +497,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   addMembers: async (characterIds) => {
     const group = get().group;
     if (!group || !characterIds.length) return;
+    markActivity();
     try {
       const members = await api.addMembers(group.id, characterIds);
       set({ members });
@@ -439,6 +510,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   removeMember: async (memberId) => {
     const group = get().group;
     if (!group) return;
+    markActivity();
     const member = get().members.find((m) => m.id === memberId);
     try {
       await api.removeMember(group.id, memberId);
@@ -452,6 +524,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   updateGroupPatch: async (patch) => {
     const group = get().group;
     if (!group) return;
+    markActivity();
     const previous = group;
     set({ group: { ...group, ...patch } });
     try {
